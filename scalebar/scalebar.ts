@@ -1,9 +1,10 @@
 import {Annotation, AnnotationView} from "models/annotations/annotation"
+import {BasicTickFormatter} from "models/formatters/basic_tick_formatter"
 import * as mixins from "core/property_mixins"
 import * as visuals from "core/visuals"
 import * as p from "core/properties"
 import {Context2d} from "core/util/canvas"
-import {TextBox} from "core/graphics"
+import {GraphicsBoxes, GraphicsBox, BaseExpo, TextBox} from "core/graphics"
 import {Color} from "core/types"
 import {Enum} from "core/kinds"
 import {Scale} from "models/scales/scale"
@@ -51,57 +52,37 @@ export class ScaleBarView extends AnnotationView {
   override model: ScaleBar
   override visuals: ScaleBar.Visuals
 
-  px_size_val: number
   unit: string
-  scale_distance: number
-  scale_length: number
-  scale0: Point = {x: 0, y: 0}
-  scale1: Point = {x: 0, y: 0}
 
   protected _render(): void {
     const {ctx} = this.layer
     const {frame} = this.plot_view
 
-    const scale_length_init = this.model.length
-    const font_size_val = parseFloat(this.model.text_font_size)
-
+    const px_length_init = this.model.length
     this.unit = this.model.unit.toString()
-    const sys_measure = this.model.system_of_measure
 
     this._defaults()
 
-    if (!this._errCheck(sys_measure, this.unit)) {
+    if (!this._errCheck(this.model.system_of_measure, this.unit)) {
       return
     }
 
-    this.px_size_val = this._calcPxsize(this.model.px_size, frame.bbox, scale_length_init)
-    this._adjPxsize(sys_measure, this.px_size_val, this.unit)
-
-    let scale_distance_init = scale_length_init * this.px_size_val
-    let scale_factor = this._calcConversion(sys_measure, scale_distance_init)
-
-    scale_distance_init = scale_distance_init * scale_factor
-    this.px_size_val = this.px_size_val * scale_factor
-
-    const scale_multiple = this._scaleMultiple(scale_distance_init)
-
-    this.scale_distance = Math.round(scale_distance_init/scale_multiple)*scale_multiple
-    this.scale_length = Math.round(this.scale_distance / this.px_size_val)
-
-    this._locationData(frame.bbox, font_size_val)
-
-    const rect_data = this._scalePointData(font_size_val)
+    const scale_props = this._scaleProperties(px_length_init, frame.bbox)
+    const label_graphics = this._labelsGraphics(scale_props)
+    const label_position = this._labelsPosition(scale_props, label_graphics)
+    const line_position = this._scaleLineDataPosition(scale_props, label_graphics)
+    const bar_position = this._scaleBarDataPosition(scale_props)
+    const adj_position = this._locationAdj(frame.bbox, label_graphics, scale_props)
     
-    this._drawBarRect(ctx, rect_data.xy)
-    
-    let line_xy = this._scaleOutlineLine()
-    this._drawOutlineLineScale(ctx, line_xy)
-
-    this._addLabels(ctx, rect_data.labels, font_size_val)
+    this._drawBarScale(ctx, bar_position, adj_position)
+    this._drawLineScale(ctx, line_position, adj_position)
+    this._drawLabels(ctx, label_graphics, label_position, adj_position)
   }
 
   protected _errCheck(sys_measure: string, unit: string) {
-    if (((unit in IMPERIAL_UNITS) != true) && (sys_measure == 'imperial') && (this.model.px_size != 'mercator')) {
+    if (((unit in IMPERIAL_UNITS) != true) && 
+      (sys_measure == 'imperial') && 
+      (this.model.px_size != 'mercator')) {
       console.log('Unit specified not present in list of imperial units (in, ft, mi)')
       return false
     }
@@ -138,218 +119,16 @@ export class ScaleBarView extends AnnotationView {
     }
   }
 
-  protected _adjPxsize(sys_measure: string, size: number, unit: string) {
-    if (sys_measure == 'imperial') {
-      if (this.model.px_size == 'mercator') {
-        this.px_size_val = size / IMPERIAL_UNITS['ft']['m']
-      } else {
-        this.px_size_val = size * IMPERIAL_UNITS[unit]['ft']
-      }
-      this.unit = 'ft'
-    }
-
-    if ((sys_measure == 'metric') && (unit != 'm')) {
-      const prefix = unit.replace('m', '')
-      let exponent = this._getKeyByValue(SI_PREFIX, prefix)
-      this.px_size_val = size * Math.pow(10, parseFloat(exponent))
-      this.unit = 'm'
-    }
-  }
-
-  protected _calcConversion(sys_measure: string, distance: number): number {
-    let conv_factor = 1
-    if ((sys_measure == 'metric') || (sys_measure == 'scientific')) {
-      let base = Math.floor(Math.log10(distance))
-      base = Math.floor(base / 3)
-      let factor = base * 3
-
-      if (factor > 3) {
-        factor = 3
-      } else if ((factor == 0) && (distance < 5)) {
-        factor = -2
-      } else if (distance / Math.pow(10, factor) < 2.5) {
-        factor = (base - 1) * 3
-      } 
-      
-      conv_factor = 1/Math.pow(10, factor)
-      if (sys_measure == 'metric') {
-        this.unit = SI_PREFIX[factor] + 'm'  
-      } else {
-        if ((factor < 0) || (factor > 2)) {
-          this.unit = '10e' + factor.toString() + ' ' + this.unit
-        }
-      } 
-
-    } else if (sys_measure == 'imperial') {
-      if (distance > 10000) {
-        conv_factor = 1/IMPERIAL_UNITS['mi']['ft'] 
-        this.unit = 'mi'
-      } else if (distance < 3) {
-        conv_factor = 1/IMPERIAL_UNITS['in']['ft'] 
-        this.unit = 'in'
-
-        let base = Math.floor(Math.log10(distance))
-
-        if ((base < 0) && (distance < 0.25)) {
-          if (distance / Math.pow(10, base) < 2.5) {
-            base -= 1
-          }
-          conv_factor = conv_factor / Math.pow(10, base)
-          this.unit = '10e' + base.toString() + ' in'
-        }
-      }
-    }
-    return conv_factor
-  }
-
-  protected _scaleMultiple(scale_distance_init: number): number {
-    const scale_type = this.model.scale_type
-    const scale_multiple_arr = [1, 2, 3, 10, 20, 25, 30, 50, 100, 200, 500, 1000]
-
-    let tmp_multiple = 2
-    let err = scale_distance_init
-    for (let i = scale_multiple_arr.length-1; i >= 0 ; i--) {
-      const distance = Math.round(scale_distance_init/scale_multiple_arr[i])*scale_multiple_arr[i]
-
-      if (scale_type == 'bar') {
-        if ( (((distance % 3) === 0) || ((distance % 2) === 0)) === false ) {
-          continue
-        }
-      }
-      if (Math.abs(scale_distance_init-distance) < err) {
-        if ((scale_multiple_arr[i] < 20) && (distance > 20)) {
-          continue
-        }
-        if ((scale_multiple_arr[i] == 20) && (distance > 200)) {
-          continue
-        }
-        if ((scale_multiple_arr[i] == 25) && (distance > 500)) {
-          continue
-        }
-        if ((scale_multiple_arr[i] == 30) && (distance > 100)) {
-          continue
-        }
-        if ((scale_multiple_arr[i] == 50) && (distance > 500)) {
-          continue
-        }
-        if ((scale_multiple_arr[i] == 100) && (distance > 1000)) {
-          continue
-        }
-        if ((scale_multiple_arr[i] == 200) && (distance > 3000)) {
-          continue
-        }
-        err = Math.abs(scale_distance_init-distance)
-        tmp_multiple = scale_multiple_arr[i]
-      }
-    }
-    return tmp_multiple
-  }
-
-  protected _sumArr(arr: number[]) {
-    let sum = 0
-    for (let i = 0; i < arr.length; i ++) {
-      sum += arr[i]
-    }
-    return sum
-  }
-
-  protected _sxLabelScientific(sxArr: number[], widthArr: number[], sxMid: number, align: string[]) {
-    const totalWidth = this._sumArr(widthArr)
-    let sx = sxMid - totalWidth/2
-    for (let i = 0; i < widthArr.length; i++) {
-      sxArr.push(sx)
-      align.push('left')
-      sx += widthArr[i]
-    }
-  }
-
-  protected _labelScientific(label: string, sx: number, sy: number, font_size: number) {
-    let txt_box = []
-    let sy_arr: number[] = []
-    let sx_arr: number[] = []
-    let widths: number[] = []
-    let align: string[] = []
-
-    const splitTxt = label.split(' ')
-
-    for (let j = 0; j < splitTxt.length; j++) {
-      const baseExp = splitTxt[j].split('e')
-      const {tb, width} = this._txtBox(baseExp[0])
-      txt_box.push(tb)
-      sy_arr.push(sy)
-      widths.push(width)
-      
-      if (baseExp.length > 1) {
-        const {tb, width} = this._txtBox(baseExp[1])
-        tb.font_size_scale = 0.7
-        txt_box.push(tb)
-        sy_arr.push(sy-(1/3)*font_size)
-        widths.push(width)
-      }
-    }
-
-    this._sxLabelScientific(sx_arr, widths, sx, align)
-
-    return {txt_box, sy_arr, sx_arr, widths, align}
-  }
-
-  protected _txtBox(txt: string) {
-    const tb = new TextBox({text: txt})
-    const {width} = tb._size()
-
-    return {tb, width}
-  }
-
-  protected _addLabels(ctx: Context2d, label_data: {'txt': string[], 'x': number[], 'y': number[]}, font_size: number) {
-    const txt_visuals = this.visuals.text.values()
-    const label_align_default = 'center'
-    txt_visuals.baseline = 'alphabetic'
-
-    let label_width_arr = []
-    let label_align_arr = []
-    let label_box_arr = []
-    let label_sx_arr = []
-    let label_sy_arr = []
-
-    for (let i = 0, end = label_data.txt.length; i < end; i++) {  
-      const y_offset_i = this.model.y_offset
-      let sx_i: number = label_data.x[i]
-      const sy_i: number = label_data.y[i] - y_offset_i
-
-      if (label_data.txt[i].includes('10e')) {
-        const {txt_box, sy_arr, sx_arr, widths, align} = this._labelScientific(label_data.txt[i], sx_i, sy_i, font_size)
-
-        label_width_arr.push(...widths)
-        label_align_arr.push(...align)
-        label_box_arr.push(...txt_box)
-        label_sx_arr.push(...sx_arr)
-        label_sy_arr.push(...sy_arr)
-        
-      } else {
-        let align = label_align_default
-        const {tb, width} = this._txtBox(label_data.txt[i])
-
-        if ((this.model.scale_type == 'bar') && (i == end - 1)) {
-          // adjust x position last item (unit string)
-          sx_i += label_width_arr[i-1] / 2
-          align = 'left'
-        }
-
-        label_width_arr.push(width)
-        label_box_arr.push(tb)
-        label_sx_arr.push(sx_i)
-        label_sy_arr.push(sy_i)
-        label_align_arr.push(align)
-      }
-    }
+  protected _scaleProperties(px_length_init: number, bbox: BBox) {
+    let px_size = this._calcPxsize(this.model.px_size, bbox, px_length_init)
+    const scale_props = this._adjPxsizeSysmeasure(px_size, px_length_init)
+    px_size = scale_props.px_size
     
-    for (let i = 0; i < label_box_arr.length; i++) {
-      const align = label_align_arr[i] as TextAlign
-      txt_visuals.align = align
-      label_box_arr[i].position = {sx: label_sx_arr[i], sy: label_sy_arr[i]}
-      label_box_arr[i].visuals = txt_visuals
-      label_box_arr[i].paint(ctx)
-    }
+    const distance_init = px_length_init * px_size
+    const scale_distance = this._scaleDistance(distance_init)
+    const scale_length = Math.round(scale_distance / px_size)
+
+    return {'distance': scale_distance, 'length': scale_length, 'factor': scale_props.scale_factor}
   }
 
   protected _calcPxsize(model_pxsize: (string | number), bbox: BBox, scale_length: number): number {
@@ -362,7 +141,7 @@ export class ScaleBarView extends AnnotationView {
       let d2 = this._calcGreatCirleDistance(p1, p2)
       size = d2 / scale_length
     } else {
-      size = this._calcPxsizeDimensions(xscale, bbox)
+    size = this._calcPxsizeDimensions(xscale, bbox)
       if (typeof(model_pxsize) == 'number') {
         size *= model_pxsize
       }
@@ -427,45 +206,36 @@ export class ScaleBarView extends AnnotationView {
     return {p1, p2} 
   }
 
-  protected _locationData(bbox: BBox, font_size: number) {
-    let y0: number = 0
-    let y1: number = 0
-    const scale_dy = this.model.height
-    const label_yoffset = this.model.y_offset
+  protected _adjPxsizeSysmeasure(px_size: number, length: number) {
+    const sys_measure = this.model.system_of_measure
+    var unit = this.unit
 
-    if (this.model.location.includes('right')) {
-      let width_out_bar = 0
-      if (this.model.scale_type == 'bar') {
-        const {width: wdistance} = this._txtBox(this.scale_distance.toString())
-        width_out_bar += wdistance / 2
+    const base_prop = this._pxsizeBaseSysmeasure(sys_measure, unit)
+    px_size *= base_prop.factor
+    unit = base_prop.base_unit
 
-        const {width: wunit} = this._txtBox(' ' + this.unit)
-        width_out_bar += wunit
-      }
-      width_out_bar += SCALE_X_OFFSET
+    const scale_factor = this._pxsizeDistanceFactor(sys_measure, px_size, unit, length)
+    px_size *= scale_factor.px_adj*scale_factor.scale_factor
+    this.unit = scale_factor.unit
 
-      this.scale1.x = bbox.right-width_out_bar
-      this.scale0.x = this.scale1.x - this.scale_length
+    return {'px_size': px_size, 'scale_factor': scale_factor.scale_factor}
+  }
+
+  protected _pxsizeBaseSysmeasure(sys_measure: string, unit: string) {
+    if (sys_measure == 'imperial') {
+      return this._pxsizeBaseImperial(unit)
     } else {
-      this.scale0.x = bbox.left + SCALE_X_OFFSET
-      this.scale1.x = this.scale0.x + this.scale_length
+      return this._pxsizeBaseMetric(unit)
     }
-    
-    if (this.model.location.includes('bottom')) {
-      y0 = bbox.bottom - SCALE_Y_OFFSET
-    } else {
-      y0 = bbox.top + SCALE_Y_OFFSET
+  }
 
-      if (this.model.scale_type == 'bar') {
-        y0 += font_size + label_yoffset + scale_dy
-      } else {
-        y0 += Math.max(font_size+label_yoffset, scale_dy)
-      }
-    }
-    y1 = y0 - scale_dy
-    
-    this.scale0.y = y0
-    this.scale1.y = y1
+  protected _pxsizeBaseMetric(unit: string) {
+    const prefix = unit.replace('m', '')
+    const exponent = this._getKeyByValue(SI_PREFIX, prefix)
+    const factor = Math.pow(10, parseFloat(exponent))
+    const base_unit = 'm'
+
+    return {factor, base_unit}
   }
 
   protected _getKeyByValue(obj: object, val: string) {
@@ -480,155 +250,442 @@ export class ScaleBarView extends AnnotationView {
     return result
   }
 
-  protected _scalePointData(font_size: number): {
-    'xy': {'x': number[][]; 'y': number[][]; 'color'?: Color[] }
-    'labels': {'txt': string[]; 'x': number[]; 'y': number[]}
-    } {
-    if (this.model.scale_type == 'bar') {
-      return this._scaleBarData()
+  protected _pxsizeBaseImperial(unit: string) {
+    var factor = 1
+    if (this.model.px_size == 'mercator') {
+      factor = 1 / IMPERIAL_UNITS['ft']['m']
     } else {
-      return this._scaleLineData(font_size)
+      factor = IMPERIAL_UNITS[unit]['ft']
+    }
+    const base_unit = 'ft'
+
+    return {factor, base_unit}
+  }
+
+  protected _pxsizeDistanceFactor(sys_measure: string, px_size: number, 
+    unit: string, length: number) {
+    const distance = px_size * length
+    if (sys_measure == 'imperial') {
+      return this._pxsizeDistanceFactorImperial(distance, unit)
+    } else {
+      return this._pxsizeDistanceFactorMetric(distance, unit)
     }
   }
 
-  protected _scaleBarData(): {
-      'xy': {'x': number[][]; 'y': number[][]; 'color': Color[] }
-      'labels': {'txt': string[]; 'x': number[]; 'y': number[]}
-    } {
-    // Bar scale is alternating dark and light colors
-    let color = []
-    let bar_x = []
-    let bar_y = []
-    let label = []
-    let label_y = []
-    let label_x = []
-    let bar_splits = 1
-    const x0:number = this.scale0.x, y0:number = this.scale0.y
-    const x1:number = this.scale1.x, y1:number = this.scale1.y
+  protected _pxsizeDistanceFactorMetric(distance: number, base_unit: string) {
+    const px_adj = 1
+    const unit = base_unit
+    let base = Math.floor(Math.log10(distance))
+    base = Math.floor(base / 3)
+    let factor = base * 3
 
-    if ((this.scale_distance % 3) === 0) {
+    if (factor > 3) {
+      factor = 3
+    } else if ((factor == 0) && (distance < 5)) {
+      factor = -2
+    } else if (distance / Math.pow(10, factor) < 2.5) {
+      factor = (base - 1) * 3
+    }   
+    const scale_factor = 1 / Math.pow(10, factor)
+  
+    return {px_adj, unit, scale_factor}
+  }
+
+  protected _pxsizeDistanceFactorImperial(distance: number, base_unit: string) {
+    let px_adj = 1
+    let scale_factor = 1
+    let unit = base_unit
+
+    if (distance > 10000) {
+      px_adj = 1/IMPERIAL_UNITS['mi']['ft'] 
+      unit = 'mi'
+      return {px_adj, unit, scale_factor}
+    }
+    if (distance >= 3) {
+      return {px_adj, unit, scale_factor}
+    }
+    // distance < 3
+    px_adj = 1/IMPERIAL_UNITS['in']['ft'] 
+    unit = 'in'
+
+    let base = Math.floor(Math.log10(distance))
+
+    if ((base < 0) && (distance < 0.25)) {
+      if (distance / Math.pow(10, base) < 2.5) {
+        base -= 1
+      }
+      scale_factor = 1 / Math.pow(10, base)
+    }
+    return {px_adj, unit, scale_factor}
+  }
+
+  protected _scaleDistance(distance_init: number): number {
+    // Find a scale distance that is a nice whole number 
+    const multiple_arr = [1, 2, 3, 10, 20, 25, 30, 50, 100, 200, 500, 1000]
+
+    let distance_update =  distance_init
+    let err = distance_init
+    multiple_arr.reverse()
+
+    for (const elm of multiple_arr) {
+      const distance = Math.round(distance_init/elm) * elm
+      if (distance == 0) continue
+
+      if (this.model.scale_type == 'bar') {
+        const bool_mod3 = distance % 3 === 0
+        const bool_mod2 = distance % 2 === 0
+
+        if ((bool_mod3 || bool_mod2) === false) continue
+      }
+
+      const err_tmp = Math.abs(distance-distance_init)
+
+      if (err_tmp >= err) continue
+
+      if ((elm < 20) && (distance > 20)) continue
+      if ((elm == 20) && (distance > 200)) continue
+      if ((elm == 25) && (distance > 500)) continue
+      if ((elm == 30) && (distance > 100)) continue
+      if ((elm == 50) && (distance > 500)) continue
+      if ((elm == 100) && (distance > 1000)) continue
+      if ((elm == 200) && (distance > 3000)) continue
+
+      err = err_tmp
+      distance_update = distance
+    }
+    return distance_update
+  }
+
+  protected _labelsGraphics(
+    scale_props: {'distance': number, 'length': number, 'factor': number}
+    ): GraphicsBoxes {
+    let label_values: number[]
+
+    const distance = scale_props.distance
+
+    label_values = this._labelValues(distance)
+    let labels_graphics = this._valueFormatTick(label_values)
+    
+    const last_idx = labels_graphics.length-1
+    labels_graphics[last_idx] = this._scientificFormatTick(scale_props.factor, label_values)
+    
+    const unit_graphics = this._unitFormat(scale_props.factor)
+
+    const gboxes = new GraphicsBoxes([...labels_graphics, unit_graphics])
+    const txt_visuals = this.visuals.text.values()
+    txt_visuals.baseline = 'alphabetic'
+    txt_visuals.line_height = 1.0
+
+    gboxes.visuals = txt_visuals
+
+    for (const item of gboxes.items) {
+      item.text_height_metric = 'cap'
+    }
+
+    return gboxes
+  }
+
+  protected _labelValues(distance: number) {
+    let split = 1
+    const label = []
+
+    if (this.model.scale_type == 'line') {
+      return [distance]
+    }
+
+    if ((distance % 3) === 0) split = 3
+    else if ((distance % 2) === 0) split = 2
+    
+    for (let i = 0; i < split + 1; i++) {
+      const label_value = (distance/split) * i
+      label.push(label_value)
+    }
+    return label
+  }
+
+  protected _unitFormat(scale_factor: number) {
+    const factor = 1 / scale_factor
+    const expo = Math.log10(factor)
+    let unit_str: string
+    
+    if (this.model.system_of_measure == 'metric') {
+      unit_str = ` ${SI_PREFIX[expo]}m`
+    } else {
+      unit_str = ` ${this.unit}`
+    }
+    return new TextBox({text: unit_str})
+  }
+
+  protected _valueFormatTick(ticks: number[]): GraphicsBox[] {
+    const formatter = new BasicTickFormatter()
+    const graphics = formatter.format_graphics(ticks, {loc: 0})
+
+    return graphics
+  }
+
+  protected _scientificFormatTick(scale_factor: number, label: number[]): GraphicsBox {
+    const factor = 1 / scale_factor
+    const expo = Math.log10(factor)
+    const last_label = label[label.length-1]
+
+    if (this.model.system_of_measure == 'metric')
+      return new TextBox({text: `${last_label}`})
+
+    if ((expo >= 0) && (expo <= 2))
+      return new TextBox({text: `${last_label}`})
+
+    const b = new TextBox({text: `${last_label}·10`})
+    const e = new TextBox({text: `${expo}`})
+    const graphics =  new BaseExpo(b, e)
+    graphics._y_anchor = 'bottom'
+    graphics.base.text_height_metric = 'cap'
+    graphics.expo.text_height_metric = 'cap'
+
+    return graphics
+  }
+
+  protected _labelsPosition(
+    scale_props: {'distance': number, 'length': number, 'factor': number},
+    labels: GraphicsBoxes
+    ): {'sx': number[], 'sy': number, 'align': TextAlign[]} {
+    let split = 1
+    const sx_arr = []
+    const align: TextAlign[] = []
+    let sy = -this.model.y_offset
+
+    const n_items = labels.length
+    const unit_graphics = labels.items[n_items-1]
+    const last_value_label = labels.items[n_items-2]
+    const {width: unit_width} = unit_graphics.size()
+    const {width: last_value_width} = last_value_label.size()
+
+    if (this.model.scale_type == 'line') {
+      const mid = (scale_props.length+2*this.model.padding)/2
+      const sx0 = mid - unit_width/2
+      const sx1 = sx0 + last_value_width / 2
+      sy -= this.model.padding
+
+      return {'sx': [sx0, sx1], 'sy': sy, 'align': ['center', 'left']}
+    }
+
+    if ((scale_props.distance % 3) === 0) split = 3
+    else if ((scale_props.distance % 2) === 0) split = 2
+    
+    for (let i = 0; i < split + 1; i++) {
+      const sx = (scale_props.length/split) * i
+      sx_arr.push(sx)
+      align.push('center')
+    }
+    const sxunit = scale_props.length + last_value_width / 2
+    sx_arr.push(sxunit)
+    align.push('left')
+
+    sy -= this.model.height
+
+    return {'sx': sx_arr, 'sy': sy, 'align': align}
+  }
+
+  protected _locationAdj(bbox: BBox, labels: GraphicsBoxes,
+    scale_props: {'distance': number, 'length': number, 'factor': number}
+    ) {
+    let sx_adj: number = 0
+    let sy_adj: number = 0
+
+    const n_items = labels.length
+    const label0 = labels.items[0]
+    const {width: label0_width} = label0.size()
+    const last_value_label = labels.items[n_items-2]
+    const {width: last_unit_width} = last_value_label.size()
+    const unit_graphics = labels.items[n_items-1]
+    const {width: unit_width} = unit_graphics.size()
+
+    if (this.model.location.includes('left')) {
+      sx_adj = bbox.left + SCALE_X_OFFSET
+
+      if (this.model.scale_type == 'bar') {
+        sx_adj += label0_width/2
+      }
+    } 
+
+    if (this.model.location.includes('right')) {
+      sx_adj = bbox.right - SCALE_X_OFFSET
+      sx_adj -= scale_props.length
+
+      if (this.model.scale_type == 'bar') {
+        sx_adj -= unit_width
+        sx_adj -= last_unit_width/2
+      }
+
+      if (this.model.scale_type == 'line') {
+        sx_adj -= 2*this.model.padding
+      }
+    }
+
+    if (this.model.location.includes('bottom')) {
+      sy_adj = bbox.bottom - SCALE_Y_OFFSET
+    } 
+
+    if (this.model.location.includes('top')) {
+      const {height} = labels.max_size()
+      sy_adj = bbox.top + SCALE_Y_OFFSET + height
+      sy_adj += this.model.y_offset
+
+      if (this.model.scale_type == 'bar') {
+        sy_adj += this.model.height
+      }
+
+      if (this.model.scale_type == 'line') {
+        sy_adj += (2 * this.model.padding)
+      }
+    }
+
+    return {sx_adj, sy_adj}
+  }
+
+  protected _scaleLineDataPosition(
+    scale_props: {'distance': number, 'length': number, 'factor': number},
+    labels: GraphicsBoxes
+    ) {
+    let sx0 = this.model.padding
+    let sx1 = scale_props.length + this.model.padding
+    let sy0 = -this.model.height - this.model.padding
+    let sy1 = - this.model.padding
+    let sx = [sx0, sx0, sx1, sx1]
+    let sy = [sy0, sy1, sy1, sy0]
+
+    const scale = {sx, sy}
+
+    const {height} = labels.max_size()
+    sy1 = -height - (2 * this.model.padding) - this.model.y_offset
+    sx1 = scale_props.length + 2*this.model.padding
+    sx = [0, 0, sx1, sx1]
+    sy = [0, sy1, sy1, 0]
+    const backgrnd = {sx, sy}
+
+    return {scale, backgrnd}
+  }
+
+  protected _scaleBarDataPosition(
+    scale_props: {'distance': number, 'length': number, 'factor': number}
+    ) {
+    const sx0: number = 0
+    let color: Color[] = []
+    let sx: number[][] = []
+    let sy: number[][] = []
+    let bar_splits: number = 1
+
+    if ((scale_props.distance % 3) === 0) {
       bar_splits = 3
-    } else if ((this.scale_distance % 2) === 0) {
+    } else if ((scale_props.distance % 2) === 0) {
       bar_splits = 4
     }
     
-    const split_px = this.scale_length / bar_splits
+    const split_px = scale_props.length / bar_splits
+
     for (let i = 0; i < bar_splits; i++) {
-      const label_value = this.scale_distance/bar_splits*i
-      const label_str = label_value.toString()
-      let bar_x0 = Math.round(x0 + split_px * i)
-      let bar_x1 = Math.round(x0 + split_px * (i+1))
-      
+      let bar_sx0 = Math.round(sx0 + split_px * i)
+      let bar_sx1 = Math.round(sx0 + split_px * (i+1))
+
       if (i%2 == 0) {
         color.push(this.model.bar_dark_color)
       } else {
         color.push(this.model.bar_light_color)
       }
-      bar_x.push([bar_x0, bar_x1, bar_x1, bar_x0])
-      bar_y.push([y0, y0, y1, y1])
+      sx.push([bar_sx0, bar_sx1, bar_sx1, bar_sx0])
+      sy.push([0, 0, -this.model.height, -this.model.height])
+    }
 
-      if ((i%2 == 0) || (bar_splits == 3)) {
-        label.push(label_str)
-        label_y.push(y1)
-        label_x.push(bar_x0)
+    return {sx, sy, color}
+  }
+
+  protected _drawLabels(
+    ctx: Context2d, labels: GraphicsBoxes,
+    label_position: {'sx': number[], 'sy': number, 'align': TextAlign[]}, 
+    adj_position: {'sx_adj': number, 'sy_adj': number}) {
+    const {sx_adj, sy_adj} = adj_position
+    const {sx, sy, align} = label_position
+
+    for (let i = 0; i < labels.length; i++) {
+      const label = labels.items[i]
+      label.position = {
+        sx: sx[i] + sx_adj,
+        sy: sy + sy_adj,
+        x_anchor: align[i]
       }
-    }
-
-    label.push(this.scale_distance.toString())
-    label_y.push(y1)
-    label_x.push(x1)
-
-    label.push(' ' + this.unit)
-    label_y.push(y1)
-    label_x.push(x1)
-
-    const xy = {'x': bar_x, 'y': bar_y, 'color': color}
-    const labels = {'txt': label, 'x': label_x, 'y': label_y}
-
-    return {'xy': xy, 'labels': labels}
-  }
-
-  protected _scaleLineData(font_size: number): {
-      'xy': {'x': number[][]; 'y': number[][]; }
-      'labels': {'txt': string[]; 'x': number[]; 'y': number[]}
-    } {
-    const label_yoffset = this.model.y_offset
-    const scale_dy = this.model.height
-    const padding = this.model.padding
-    const x0:number = this.scale0.x, y0:number = this.scale0.y
-    const x1:number = this.scale1.x, y1:number = this.scale1.y
-
-    let label_txt = this.scale_distance.toString()
-
-    if (this.unit.length > 0) {
-      if (this.unit.includes('10e')) {
-        label_txt += '·'
-      } else {
-        label_txt += ' '
-      }
-      label_txt += this.unit
-    }
-
-    let adj_height = 0
-    if (label_txt.includes('10e')) {
-      adj_height = 2
-    }
-    const adjust_top = Math.max(font_size + label_yoffset - scale_dy + adj_height, padding)
-    const x = [[x0-padding, x1+padding, x1+padding, x0-padding]]
-    const y = [[y0+padding, y0+padding, y1-adjust_top, y1-adjust_top]]
-
-    const label_x = [(x1+x0) / 2]
-    const label_y = [y0 - label_yoffset]
-
-    const xy = {'x': x, 'y': y}
-    const label = {'txt': [label_txt], 'x': label_x, 'y': label_y}
-
-    return {'xy': xy, 'labels': label}
-  }
-
-  protected _scaleOutlineLine() {
-    let x: number[]
-    let y: number[]
-    const scale_type = this.model.scale_type
-    const x0:number = this.scale0.x, y0:number = this.scale0.y
-    const x1:number = this.scale1.x, y1:number = this.scale1.y
-
-    if (scale_type == 'bar') {
-      x = [x0, x1, x1, x0]
-      y = [y0, y0, y1, y1]
-    } else {
-      x = [x0, x0, x1, x1]
-      y = [y1, y0, y0, y1]
-    }
-    return {'x': x, 'y': y}
-  }
-
-  protected _drawOutlineLineScale(ctx: Context2d, xy_data: {'x': number[], 'y': number[]}) {
-    ctx.beginPath()
-    for (let i = 0; i < xy_data.x.length; i++) {
-      ctx.lineTo(xy_data.x[i], xy_data.y[i])
-    }
-
-    if (this.model.scale_type == 'bar') {
-      ctx.closePath()
-    } else {
-      ctx.stroke()
+      label.paint(ctx)
     }
     this.visuals.line.apply(ctx)
   }
 
-  protected _drawBarRect(ctx: Context2d, xy_data: {'x': number[][], 'y': number[][], 'color'?: Color[] }) {
-    for (let j = 0; j < xy_data.x.length; j++) { 
+  protected _drawLineScale(
+    ctx: Context2d,
+    sxy: {'scale': {'sx': number[], 'sy': number[]},
+      'backgrnd': {'sx': number[], 'sy': number[]}},
+    adj_position: {'sx_adj': number, 'sy_adj': number}
+    ) {
+    // line type scale: line drawn on-top bar
+    if (this.model.scale_type != 'line')
+      return
+
+    const {sx_adj, sy_adj} = adj_position
+    const {scale, backgrnd} = sxy
+
+    ctx.beginPath()
+    for (let i = 0; i < backgrnd.sx.length; i++) {
+      let sx = backgrnd.sx[i] + sx_adj
+      let sy = backgrnd.sy[i] + sy_adj
+      ctx.lineTo(sx, sy)
+    }
+    ctx.closePath()
+    this.visuals.fill.apply(ctx)
+
+    ctx.beginPath()
+    for (let i = 0; i < scale.sx.length; i++) {
+      const sx = scale.sx[i] + sx_adj
+      const sy = scale.sy[i] + sy_adj
+      ctx.lineTo(sx, sy)
+    }
+    ctx.stroke()
+    this.visuals.line.apply(ctx)
+  }
+
+  protected _drawBarScale(
+    ctx: Context2d, 
+    sxy_bar: {'sx': number[][], 'sy': number[][], 'color'?: Color[] },
+    adj_position: {'sx_adj': number, 'sy_adj': number}
+    ) {
+    // bar type scale: alternating bars with an outline
+    if (this.model.scale_type != 'bar')
+      return
+
+    const {sx_adj, sy_adj} = adj_position
+
+    for (let j = 0; j < sxy_bar.sx.length; j++) { 
       ctx.beginPath()
-      for (let i = 0; i < xy_data.x[j].length; i++) {
-        ctx.lineTo(xy_data.x[j][i], xy_data.y[j][i])
+      for (let i = 0; i < sxy_bar.sx[j].length; i++) {
+        const sx = sxy_bar.sx[j][i] + sx_adj
+        const sy = sxy_bar.sy[j][i] + sy_adj
+        ctx.lineTo(sx, sy)
       }
       ctx.closePath()
-      if ((this.model.scale_type == 'bar') && (xy_data.color)) {
-        this.model.fill_color = xy_data.color[j]
+      if ((this.model.scale_type == 'bar') && (sxy_bar.color)) {
+        this.model.fill_color = sxy_bar.color[j]
       }
       this.visuals.fill.apply(ctx)
     }
+
+    const min_sx = Math.min(...sxy_bar.sx[0]) + sx_adj
+    const max_sx = Math.max(...sxy_bar.sx[sxy_bar.sx.length-1]) + sx_adj
+    const min_sy = Math.min(...sxy_bar.sy[0]) + sy_adj
+    const max_sy = Math.max(...sxy_bar.sy[0]) + sy_adj
+
+    ctx.beginPath()
+    ctx.lineTo(min_sx, min_sy)
+    ctx.lineTo(max_sx, min_sy)
+    ctx.lineTo(max_sx, max_sy)
+    ctx.lineTo(min_sx, max_sy)
+    ctx.closePath()
+    this.visuals.line.apply(ctx)
   }
 }
 
