@@ -68,7 +68,7 @@ class ScaleBar(Annotation):
 
     padding = Int(default=2, help='''
     For the scale of type ``line`` a background filling is added. 
-    Padding is amount the background is outside the scale.
+    Padding is amount of background that is outside the scale.
     '''
     )
 
